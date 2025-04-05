@@ -1,25 +1,114 @@
 import datetime
+import json
+import random
 import re
+from uuid import uuid4
 
 from django.contrib import admin
+from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.template.defaultfilters import wordwrap
+from django.template.loader import render_to_string
+from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils.safestring import SafeString
+from django.utils.timezone import make_aware, now
 
 from members.models import MEMBERSHIP_LEVELS, PLATINUM_MEMBERSHIP, CorporateMember
 
-from .models import Release, upload_to_artifact, upload_to_checksum
+from .admin import render_checklist
+from .models import (
+    FeatureRelease,
+    PreRelease,
+    Release,
+    Releaser,
+    SecurityIssue,
+    SecurityRelease,
+    SEVERITY_LEVELS_DOCS,
+    upload_to_artifact,
+    upload_to_checksum,
+)
 from .templatetags.date_format import isodate
 from .templatetags.release_notes import get_latest_micro_release, release_notes
 
+# Mixin from test2.py, used by checklist-related test classes
+class BaseChecklistTestCaseMixin:
+    checklist_class = None
+    request_factory = RequestFactory()
 
+    def debug_checklist(self, content):
+        with open(f"{self.id()}-checklist.md", "w") as f:
+            f.write(content)
+
+    def make_releaser(self):
+        return Releaser.objects.create(
+            user=User.objects.create(username=f"releaser-{uuid4()}"),
+            key_id="1234567890ABCDEF",
+            key_url="https://github.com/releaser.gpg",
+        )
+
+    def make_checklist(self, releaser=None, when=None, **kwargs):
+        if releaser is None:
+            releaser = self.make_releaser()
+        if when is None:
+            when = now() + datetime.timedelta(days=10)
+        return self.checklist_class.objects.create(
+            releaser=releaser, when=when, **kwargs
+        )
+
+    def assertNotInChecklistContent(self, text, content):
+        """Show more readable error message on `assertNotIn` failures."""
+        idx = content.find(text)
+        if idx != -1:
+            start = max(idx - 10, 0)
+            end = min(start + 100, len(content))
+            fragment = content[start:end]
+            self.fail(f"{text!r} unexpectedly found in:\n{fragment}")
+
+    def assertStubReleaseNotesAdded(self, release, content):
+        expected = render_to_string(
+            "generator/_stub_release_notes.md", {"release": release}
+        )
+        self.assertIn(expected, content)
+
+    @override_settings(
+        TEMPLATES=[
+            {
+                "BACKEND": "django.template.backends.django.DjangoTemplates",
+                "DIRS": [],
+                "APP_DIRS": True,
+                "OPTIONS": {
+                    "context_processors": [],
+                    "string_if_invalid": "INVALID: %s",
+                },
+            }
+        ]
+    )
+    def do_render_checklist(self, checklist_instance=None):
+        if checklist_instance is None:
+            checklist_instance = self.make_checklist()
+
+        request = self.request_factory.get("/")
+        response = render_checklist(request, [checklist_instance])
+        self.assertEqual(response["Content-Type"], "text/markdown")
+
+        content = response.content.decode("utf-8")
+        self.assertNotInChecklistContent("INVALID", content)
+
+        return content
+
+    def make_release(self, **kwargs):
+        version = kwargs.setdefault("version", "5.2")
+        kwargs.setdefault("date", datetime.date(2025, 4, 2))
+        kwargs.setdefault("is_lts", version.split(".", 1)[1].startswith("2"))
+        return Release.objects.create(**kwargs)
+
+# Test classes from test1.py
 class TestTemplateTags(TestCase):
     def test_get_latest_micro_release(self):
         Release.objects.create(major=1, minor=8, micro=0, is_lts=True, version="1.8")
         Release.objects.create(major=1, minor=8, micro=1, is_lts=True, version="1.8.1")
-
         self.assertEqual(get_latest_micro_release("1.8"), "1.8.1")
         self.assertEqual(get_latest_micro_release("1.4"), None)
 
@@ -61,7 +150,6 @@ class TestTemplateTags(TestCase):
     @override_settings(LANGUAGE_CODE="nn")
     def test_isodate_translated(self):
         self.assertEqual(isodate("2005-07-21"), "21. juli 2005")
-
 
 class TestReleaseManager(TestCase):
     @classmethod
@@ -164,7 +252,6 @@ class TestReleaseManager(TestCase):
         )
         self.assertEqual(Release.objects.preview().version, "1.9b2")
 
-
 class ReleaseTestCase(TestCase):
     def test_is_published(self):
         today = datetime.date.today()
@@ -212,7 +299,6 @@ class ReleaseTestCase(TestCase):
             with self.subTest(**params):
                 self.assertEqual(previous.eol_date, expected_eol_date)
 
-
 class ReleaseUploadToTestCase(SimpleTestCase):
     def test_upload_to_artifact(self):
         for version, filename, expected in [
@@ -258,11 +344,9 @@ class ReleaseUploadToTestCase(SimpleTestCase):
         ]:
             with self.subTest(version=version):
                 self.assertEqual(
-                    # filename should not matter
                     upload_to_checksum(Release(version=version), filename=None),
                     expected,
                 )
-
 
 class ReleaseAdminFormTestCase(TestCase):
     @classmethod
@@ -392,13 +476,14 @@ class ReleaseAdminFormTestCase(TestCase):
             self.fail(f"Unexpected validation error {e}")
 
     def test_artifact_file_inputs_have_extension_hint(self):
-        form = self.form_class(auto_id=None)  # auto_id=None makes testing easier
+        form = self.form_class(auto_id=None)
         self.assertHTMLEqual(
             form["tarball"].as_widget(),
             '<input type="file" name="tarball" accept=".tar.gz">',
         )
         self.assertHTMLEqual(
-            form["wheel"].as_widget(), '<input type="file" name="wheel" accept=".whl">'
+            form["wheel"].as_widget(),
+            '<input type="file" name="wheel" accept=".whl">',
         )
         self.assertHTMLEqual(
             form["checksum"].as_widget(),
@@ -408,7 +493,6 @@ class ReleaseAdminFormTestCase(TestCase):
     def test_file_upload_renames_correctly(self):
         data = {"version": "1.2.3"}
         files = {
-            # The content of the files doesn't matter
             "tarball": ContentFile(b".", name="django-1.2.3.tar.gz"),
             "wheel": ContentFile(b".", name="django-1.2.3-py3-none-any.whl"),
             "checksum": ContentFile(b".", name="some-random-name.checksum.txt"),
@@ -422,7 +506,6 @@ class ReleaseAdminFormTestCase(TestCase):
         )
         self.assertEqual(release.checksum.name, "pgp/Django-1.2.3.checksum.txt")
 
-
 class RedirectViewTestCase(TestCase):
     def test_redirect(self):
         Release.objects.create(
@@ -432,7 +515,6 @@ class RedirectViewTestCase(TestCase):
             wheel="test.whl",
             checksum="test.checksum.txt",
         )
-
         for kind, url in [
             ("tarball", "/m/test.tar.gz"),
             ("wheel", "/m/test.whl"),
@@ -469,7 +551,6 @@ class RedirectViewTestCase(TestCase):
                 with self.subTest(kind=kind, **params):
                     self.assertEqual(response.status_code, status_code)
 
-
 class CorporateMembersTestCase(TestCase):
     @classmethod
     def setUpTestData(cls):
@@ -496,7 +577,6 @@ class CorporateMembersTestCase(TestCase):
             membership_level=level,
             description=f"Some notes about this {level_name} member",
         )
-        # ensure each member is included in `for_public_display`
         member.invoice_set.create(
             amount=level * 1000,
             sent_date=self.today,
@@ -510,9 +590,7 @@ class CorporateMembersTestCase(TestCase):
             self.make_member(level, level_name)
             for level, level_name in MEMBERSHIP_LEVELS
         ]
-
         response = self.client.get(reverse("download"))
-
         self.assertContains(response, "<h3>Diamond and Platinum Members</h3>")
         member_link = (
             lambda m: f'<a href="{m.url}" title="{m.display_name}">{m.description}</a>'
@@ -531,11 +609,279 @@ class CorporateMembersTestCase(TestCase):
             for level, level_name in MEMBERSHIP_LEVELS
             if level < PLATINUM_MEMBERSHIP
         ]
-
         response = self.client.get(reverse("download"))
-
         self.assertNotContains(response, "<h3>Diamond and Platinum Members</h3>")
         for member in members:
             self.assertNotContains(response, member.display_name)
             self.assertNotContains(response, member.url)
             self.assertNotContains(response, member.description)
+
+# Test classes from test2.py
+class SecurityReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
+    checklist_class = SecurityRelease
+
+    def make_security_issue(
+        self,
+        security_release_checklist,
+        releases=None,
+        *,
+        cve_year_number=None,
+        **kwargs,
+    ):
+        if cve_year_number is None:
+            current_year = now().year
+            random_5digit = random.randint(10000, 100000)
+            cve_year_number = f"CVE-{current_year}-{random_5digit}"
+        issue = SecurityIssue.objects.create(
+            release=security_release_checklist,
+            cve_year_number=cve_year_number,
+            **kwargs,
+        )
+        if releases is None:
+            releases = [self.make_release()]
+        issue.releases.add(*releases)
+        return issue
+
+    def make_checklist(self, with_issues=True, releases=None, **kwargs):
+        checklist = super().make_checklist(**kwargs)
+        if releases is None:
+            releases = [self.make_release()]
+        if releases != [] and with_issues:
+            self.make_security_issue(checklist, releases=releases)
+        return checklist
+
+    def test_render_checklist_simple(self):
+        checklist = self.make_checklist()
+        checklist_content = self.do_render_checklist(checklist)
+        self.assertIn(
+            "- [ ] Submit a CVE Request https://cveform.mitre.org for all issues",
+            checklist_content,
+        )
+        self.assertStubReleaseNotesAdded(checklist.latest_release, checklist_content)
+
+    def test_render_checklist_affects_prerelease(self):
+        releases = [
+            self.make_release(version="5.0.14", date=datetime.date(2025, 4, 2)),
+            self.make_release(version="5.1.8", date=datetime.date(2025, 4, 2)),
+            self.make_release(version="5.2rc1", date=datetime.date(2025, 3, 19)),
+        ]
+        checklist = self.make_checklist(releases=[])
+        self.make_security_issue(checklist, releases, cve_year_number="CVE-2025-11111")
+        self.make_security_issue(checklist, releases, cve_year_number="CVE-2025-22222")
+        checklist_content = self.do_render_checklist(checklist)
+        self.debug_checklist(checklist_content)
+        self.assertNotInChecklistContent("5.2 before 5.2rc1", checklist_content)
+        self.assertIn(
+            "- Affected product(s)/code base (SPLIT in product and version (X before Y) "
+            "in rows!):",
+            checklist_content,
+        )
+        for release in ("5.1 before 5.1.8", "5.0 before 5.0.14"):
+            with self.subTest(release=release):
+                expected = f"[row 1] Django\n      [row 2] {release}"
+                self.assertIn(expected, checklist_content)
+
+    def test_render_checklist_blogdescription_display(self):
+        checklist = self.make_checklist(releases=[])
+        blog = (
+            "This is a blog description that would be used in the Django site "
+            '"News" section. The full list of news can be found `in this link '
+            "<https://www.djangoproject.com/weblog/>`_."
+        )
+        self.make_security_issue(checklist, blogdescription=blog)
+        checklist_content = self.do_render_checklist(checklist)
+        self.assertIn(
+            "- [ ] Submit a CVE Request https://cveform.mitre.org for all issues",
+            checklist_content,
+        )
+        self.assertIn(wordwrap(blog, 80), checklist_content)
+
+    def test_render_cve_json(self):
+        releases = [
+            self.make_release(version="5.0.14", date=datetime.date(2025, 4, 2)),
+            self.make_release(version="5.1.8", date=datetime.date(2025, 4, 2)),
+            self.make_release(version="5.2rc1", date=datetime.date(2025, 3, 19)),
+        ]
+        when = datetime.datetime(2024, 12, 4, 10)
+        checklist = self.make_checklist(
+            releases=[],
+            when=make_aware(when),
+        )
+        cve_number = "CVE-2024-53907"
+        cve_summary = "Potential denial-of-service in django.utils.html.strip_tags()"
+        cve_description = (
+            "The strip_tags() method and striptags template filter are subject to a "
+            "potential denial-of-service attack via certain inputs containing large "
+            "sequences of nested incomplete HTML entities."
+        )
+        reporter = "jiangniao"
+        issue = self.make_security_issue(
+            checklist,
+            releases,
+            cve_year_number=cve_number,
+            summary=cve_summary,
+            description=cve_description,
+            reporter=reporter,
+        )
+        checklist_content = self.do_render_checklist(checklist)
+        affected_versions = [
+            {
+                "collectionURL": "https://github.com/django/django/",
+                "defaultStatus": "affected",
+                "packageName": "django",
+                "versions": [
+                    {
+                        "lessThan": "5.1.8",
+                        "status": "affected",
+                        "version": "5.1.0",
+                        "versionType": "semver",
+                    },
+                    {
+                        "lessThan": "5.1.*",
+                        "status": "unaffected",
+                        "version": "5.1.8",
+                        "versionType": "semver",
+                    },
+                    {
+                        "lessThan": "5.0.14",
+                        "status": "affected",
+                        "version": "5.0.0",
+                        "versionType": "semver",
+                    },
+                    {
+                        "lessThan": "5.0.*",
+                        "status": "unaffected",
+                        "version": "5.0.14",
+                        "versionType": "semver",
+                    },
+                ],
+            }
+        ]
+        credits = [
+            {
+                "lang": "en",
+                "type": "reporter",
+                "value": f"Django would like to thank {reporter} for reporting this issue.",
+            }
+        ]
+        expected = [
+            ("affected", affected_versions),
+            ("credits", credits),
+            ("datePublic", "12/04/2024"),
+            ("descriptions", [{"lang": "en", "value": cve_description}]),
+            (
+                "metrics",
+                [
+                    {
+                        "other": {
+                            "content": {
+                                "namespace": SEVERITY_LEVELS_DOCS,
+                                "value": "moderate",
+                            },
+                            "type": "Django severity rating",
+                        }
+                    }
+                ],
+            ),
+            (
+                "references",
+                [
+                    {
+                        "name": "Django security releases issued: 5.1.8 and 5.0.14",
+                        "tags": ["vendor-advisory"],
+                        "url": checklist.blogpost_link,
+                    }
+                ],
+            ),
+            (
+                "timeline",
+                [
+                    {
+                        "lang": "en",
+                        "time": checklist.when.isoformat(),
+                        "value": "Made public.",
+                    }
+                ],
+            ),
+            ("title", cve_summary),
+        ]
+        cve_data = issue.cve_data
+        for key, value in expected:
+            with self.subTest(key=key):
+                self.assertEqual(cve_data.get(key), value)
+        cve_json = json.dumps(cve_data, sort_keys=True, indent=2)
+        with self.subTest(key="json"):
+            self.assertIn(cve_json, checklist_content)
+
+class PreReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
+    checklist_class = PreRelease
+
+    def make_checklist(self, **kwargs):
+        future = now() + datetime.timedelta(days=75)
+        feature_release = FeatureRelease.objects.create(
+            when=future, tagline="collection"
+        )
+        return super().make_checklist(feature_release=feature_release, **kwargs)
+
+    def test_render_checklist(self):
+        status_to_version = {
+            "a": "alpha",
+            "b": "beta",
+            "rc": "release candidate",
+        }
+        for status, version in status_to_version.items():
+            release = self.make_release(
+                version=f"5.2{status}1", date=datetime.date(2025, 4, 2), is_lts=True
+            )
+            with self.subTest(version=version):
+                instance = self.make_checklist(verbose_version=version, release=release)
+                checklist_content = self.do_render_checklist(instance)
+                self.assertIn(
+                    "- [ ] Update the translation catalogs:", checklist_content
+                )
+                if status == "rc":
+                    self.assertIn(
+                        "- [ ] Post on Forum calling for translations!",
+                        checklist_content,
+                    )
+                else:
+                    self.assertNotInChecklistContent(
+                        "- [ ] Post on Forum calling for translations!",
+                        checklist_content,
+                    )
+
+class FeatureReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
+    checklist_class = FeatureRelease
+
+    def test_render_checklist(self):
+        eom_release = self.make_release(version="5.1", date=datetime.date(2024, 9, 2))
+        release = self.make_release(version="5.2", date=datetime.date(2025, 4, 2))
+        instance = self.make_checklist(release=release, eom_release=eom_release)
+        checklist_content = self.do_render_checklist(instance)
+        version_trove_classifier_updates = """- [ ] Local updates of version and trove classifier:
+  - Update the version number in `django/__init__.py` for the release.
+    - `VERSION = (5, 2, 0, "final", 0)`
+  - Ensure the "Development Status" trove classifier in `pyproject.toml` is:
+    - `Development Status :: 5 - Production/Stable`"""
+        post_release_bump = """- [ ] BUMP **MINOR VERSION** in `django/__init__.py`
+  - `VERSION = (5, 2, 1, "alpha", 0)`
+  - `git commit -m '[5.2.x] Post-release version bump.'`"""
+        feature_release_tasks = [
+            "- Remove the `UNDER DEVELOPMENT` header at the top of the release notes",
+            "- Remove the `Expected` prefix and update the release date if necessary",
+            "- [ ] Create a new branch from the current stable branch in the "
+            "[django-docs-translations repository]",
+            "- [ ] Update the metadata for the docs in "
+            "https://www.djangoproject.com/admin/docs/documentrelease/",
+            "- Create new `DocumentRelease` objects for each language",
+            "- [ ] Update djangoproject.com's [robots.docs.txt]",
+            "- [ ] Update the current stable branch and remove the pre-release branch",
+            "- [ ] Update the download page on djangoproject.com.",
+            version_trove_classifier_updates,
+            post_release_bump,
+        ]
+        for feature_release_task in feature_release_tasks:
+            with self.subTest(task=feature_release_task):
+                self.assertIn(feature_release_task, checklist_content)
+        with self.subTest(task="Stub release notes added"):
+            self.assertStubReleaseNotesAdded(release, checklist_content)
